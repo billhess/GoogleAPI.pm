@@ -1,0 +1,349 @@
+#!perl
+#======================================================================
+#
+# NAME:  bulk_file_delete
+#
+# DESC:  Delete files in a Google Shared Drive with options
+#
+# ARGS:  bulk_file_delete  
+#            < Google API Storage Dir >
+#            < drive name >
+#            < path name >
+#            < matches OR contains <file name> >
+#            [ before  <yyyy-mm-ddThh:mm:ss> OR
+#              after   <yyyy-mm-ddThh:mm:ss> OR
+#              between <yyyy-mm-ddThh:mm:ss>,<yyyy-mm-ddThh:mm:ss> OR
+#              beforedays <days> ]
+#            [ <file type>[,file type 2,...] ]
+#            [ delete files flag <0|1> ]
+#            [ debug flag <0|1> ]
+#
+#
+# RETN:  
+#
+# HIST:  
+#
+#======================================================================
+# Copyright 2016 - Technology Resource Group LLC as an unpublished work
+# For info email info@techrg.com
+#======================================================================
+use strict;
+
+use Data::Dumper;
+use Date::Calc qw(Add_Delta_Days);
+use Time::Local;
+
+
+use GoogleAPI;
+use GoogleAPI::Drive;
+
+$Data::Dumper::Indent = 1;
+
+
+
+#======================================================================
+# Get the command line args
+#======================================================================
+
+# Google REST API Storage Dir
+my $sdir = $ARGV[0];
+if( ($sdir eq "") || (! -d $sdir) ) {
+   print "ERROR: Bad Google API Storage Dir\n\n";
+   print_usage();
+}
+
+
+# SHARED DRIVE
+my $drive_name = $ARGV[1];
+if( $drive_name eq "" ) {
+   print "ERROR: Bad Shared Drive\n\n";
+   print_usage();
+}
+
+
+# FOLDER PATH
+my $path_name = $ARGV[2];
+
+
+# FILE NAME
+my $file_name_matches;
+my $file_name_contains;
+
+if( $ARGV[3] ) {
+   my ($a, $fn) = split /\s+/, $ARGV[3];
+
+   if( uc($a) eq "MATCHES" ) {
+      $file_name_matches = $fn;
+   }
+   elsif( uc($a) eq "CONTAINS" ) {
+      $file_name_contains = $fn;
+   }
+   else {
+      print "ERROR: File Name field must start with MATCHES or CONTAINS\n\n";
+      print_usage();
+   }
+}
+
+
+
+# FILE MODIFICATION DATE
+my $file_mod;
+
+if( $ARGV[4] ) {
+
+   my ($a, $mod) = split /\s+/, $ARGV[4];
+   
+   if( uc($a) eq "BEFORE" ) {
+      $file_mod = qq(modifiedTime < '$mod');
+   }
+   if( uc($a) eq "AFTER" ) {
+      $file_mod = qq(modifiedTime > '$mod');
+   }
+   elsif( uc($a) eq "BETWEEN" ) {
+      my ($dt1, $dt2) = split ",", $mod;
+      $file_mod = qq((modifiedTime > '$dt1' and modifiedTime < '$dt2'));
+   }
+   elsif( uc($a) eq "BEFOREDAYS" ) {
+      my $days = $mod;
+      $days = $days * -1 if $days > 0;
+      
+      my @d  = localtime(time);
+      my ($y, $m, $d) = Add_Delta_Days($d[5]+1900, $d[4]+1, $d[3], $days);
+
+      $file_mod = "modifiedTime < " .
+          sprintf("'%04d-%02d-%02dT%02d:%02d:%02d'",
+                  $y, $m, $d, $d[2], $d[1], $d[0]);
+   }
+   else {
+      print_usage();
+   }
+}
+
+
+
+# FILE TYPE
+my @file_types = split ',', $ARGV[5];
+
+
+my $delete_files = $ARGV[6] || 0;
+my $debug        = $ARGV[7] || 0;
+
+
+if($debug) {
+   print "DRIVE NAME         = $drive_name\n";
+   print "PATH NAME          = $path_name\n";
+   print "FILE NAME MATCHES  = $file_name_matches\n";
+   print "FILE NAME CONTAINS = $file_name_contains\n";
+   print "FILE MODIFICATION  = $file_mod\n";
+
+   foreach ( @file_types ) {
+      print "FILE TYPE          = $_\n";
+   }
+
+   print "DELETE FILES       = $delete_files\n";
+   print "DEBUG              = $debug\n";
+   print "\n\n";
+}
+
+
+# exit 0;
+
+
+
+#======================================================================
+# Google API
+#======================================================================
+my $g = GoogleAPI->new( { storage_dir => $sdir } );
+
+$g->{debug}      = 1 if $debug > 1;
+$g->{debug_http} = 1 if $debug > 1;
+
+#$g->{retry_max}  = 1;
+
+# Check and Refresh the token if needed
+if( $g->oauth2_check_token() ) {
+   print "ERROR: Problem refreshing token\n";
+   exit 1;
+}
+
+
+
+
+
+my $rc;
+my $msg;
+
+#------------------------------------------------------------
+# Get the Drive
+#------------------------------------------------------------      
+my $drive = GoogleAPI::Drive::TeamDrive->get( $g, $drive_name );
+
+if(! $drive) {
+   $rc  = 1;
+   $msg = "ERROR: could not find shared drive - $drive_name";
+   print "$msg\n";
+   exit $rc;
+}
+
+my $drive_id = $drive->{id};
+
+print "DRIVE ID = $drive_id\n\n" if $debug;
+print Dumper($drive), "\n\n\n" if $debug > 1;
+
+      
+
+
+#------------------------------------------------------------
+# Get the Folder if not already passed in
+#------------------------------------------------------------
+my $folder;
+
+if( $path_name ne "" ) {
+   $folder = $drive->walk_path($path_name);
+}
+else {
+   $folder = $drive;
+}
+
+if(! $folder) {
+   $rc  = 1;
+   $msg =  "ERROR: could not find folder - ";
+   $msg .= "$drive_name - $path_name";
+   print "$msg\n";
+   exit $rc;
+}
+         
+my $folder_id = $folder->{id};
+
+      
+print "FOLDER ID = $folder_id\n\n" if $debug;
+print Dumper($folder), "\n\n\n" if $debug > 1;
+
+
+
+#----------------------------------------------------------------------
+# Search for the files if not already passed in
+#----------------------------------------------------------------------
+my $query;
+
+$query .= qq("$folder_id" in parents );
+$query .= qq(and trashed = false );
+
+if( scalar @file_types == 1 ) {
+   $query .= qq(and mimeType = '$file_types[0]' );
+}
+elsif( scalar @file_types > 1 ) {
+
+   # Add opening paren
+   $query .= "and (";
+
+   foreach (@file_types) {
+      $query .= qq(mimeType = '$_' or );
+   }
+
+   # Remove last 'or' and surrounding spaces
+   $query =~ s/\s+or\s+$//;
+
+   # Add closing paren with a space
+   $query .= ") ";
+}
+
+$query .= qq(and name = "$file_name_matches" )
+    if $file_name_matches ne "";
+
+$query .= qq(and name contains "$file_name_contains" )
+    if $file_name_contains ne "";
+
+$query .= qq(and $file_mod )
+    if $file_mod  ne "";
+
+print "QUERY:\n$query\n\n" if $debug;
+
+
+my $fields = "nextPageToken, files(kind,id,name,createdTime,modifiedTime,mimeType,parents)";
+
+my $params = { corpora => 'drive',
+               q       => $query,
+               fields  => $fields,
+               driveId => $drive_id,
+               supportsAllDrives => 'true',
+               includeItemsFromAllDrives => 'true'  };
+      
+my $flist =  GoogleAPI::Drive::FileList->new( $g, $params );
+
+if(! $flist) {
+   $rc  = 1;
+   $msg = "ERROR: could not get File List";
+   print "$msg\n";
+   exit $rc;
+}
+      
+
+
+print "FILE LIST - Found ", scalar @{$flist->{files}}, " files\n\n" if $debug;
+print Dumper($flist), "\n\n" if $debug > 1;
+
+my $pagecnt = 1;
+
+do {
+   print "\nPAGECNT = $pagecnt\n" if $debug;
+   
+   foreach my $f ( @{$flist->{files}} ) {
+      print "FILE = $f->{name}\n" if $debug;
+      
+      if( $delete_files ) {
+         my $rc = $f->delete( { supportsAllDrives => 'true' } );      
+         print "DELETE RC = $rc\n" if $debug;
+      }
+      else {
+         print "Not deleting the file\n" if $debug;
+      }
+      
+      print "\n" if $debug;
+   }
+
+   $pagecnt++;
+   
+} while( $flist->list_next_page($g, $params) );
+
+
+
+
+
+#======================================================================
+# END OF MAIN PROGRAM
+#======================================================================
+if( $debug ) {
+   print "\n\n\nERROR:\n";
+   $g->dump_error();
+}
+
+if( $debug > 1 ) {
+   print "\n\n\GoogleAPI DEBUG:\n";
+   $g->dump_debug();
+}
+
+
+
+#======================================================================
+# USAGE
+#======================================================================
+sub print_usage {
+   print
+       "USAGE:  bulk_file_delete \n",  
+       "            < Google API Storage Dir >\n",
+       "            < drive name >\n",
+       "            < path name >\n",
+       "            < matches OR contains <file name> >\n",
+       "            [ before  <yyyy-mm-ddThh:mm:ss> OR\n",
+       "              after   <yyyy-mm-ddThh:mm:ss> OR\n",
+       "              between <yyyy-mm-ddThh:mm:ss>,<yyyy-mm-ddThh:mm:ss> OR\n",
+       "              beforedays <days> ]\n",
+       "            [ <file type>[,file type 2,...] ]\n",
+       "            [ delete files flag <0|1> ]\n",
+       "            [ debug flag <0|1> ]\n",
+       "\n\n";
+
+   exit 1;
+}
+

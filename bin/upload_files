@@ -1,0 +1,550 @@
+#!perl
+#======================================================================
+#
+# NAME:  upload_files
+#
+# DESC:  Upload files to a Google Shared Drive/Folder Path
+#
+# ARGS:  upload_files  
+#            < Google API Storage Dir >
+#            < drive name >
+#            < path name >
+#            < update files  0=upload 1=upload/update 2=delete/upload >
+#            < upload files flag  0|1 >
+#            < file size threshold for resumable upload (default 5mb) >
+#            < resumable upload type  SINGLE|MULTIPLE >
+#            < debug flag  0|1  >
+#            < local file name 1 >  < mimetype 1 >
+#                ...,
+#            < local file name N >  < mimetype N >
+#
+#
+#  Update Flag 0 - Upload the file which will also reside in samme folder 
+#                  Drive supports more than one filename in a folder
+#              1 - Create a new version of the file in Drive so that only
+#                  one file of the given name is in the folder
+#              2 - Delete the existing file in Drive and replace it
+#
+#
+# RETN:  
+#
+# HIST:  
+#
+#======================================================================
+# Copyright 2016 - Technology Resource Group LLC as an unpublished work
+# For info email info@techrg.com
+#======================================================================
+use strict;
+
+use Data::Dumper;
+use File::Basename;
+use Time::Local;
+
+
+use GoogleAPI;
+use GoogleAPI::Drive;
+
+$Data::Dumper::Indent = 1;
+
+
+
+#======================================================================
+# Get the command line args
+#======================================================================
+
+# Google REST API Storage Dir
+my $sdir = $ARGV[0];
+if( ($sdir eq "") || (! -d $sdir) ) {
+   print "ERROR: Bad Google API Storage Dir\n\n";
+   print_usage();
+}
+
+
+# SHARED DRIVE
+my $drive_name = $ARGV[1];
+if( $drive_name eq "" ) {
+   print "ERROR: Bad Shared Drive\n\n";
+   print_usage();
+}
+
+
+# FOLDER PATH
+my $path_name      = $ARGV[2];
+
+
+my $update         = $ARGV[3] || 0;
+my $upload_files   = $ARGV[4] || 0;
+my $maxsize        = $ARGV[5] || 5 * 1024 * 1024;
+my $resumable_type = $ARGV[6] || "MULTIPLE";
+my $debug          = $ARGV[7] || 0;
+
+
+if( $resumable_type !~ /^SINGLE|MULTIPLE$/ ) {
+   print STDERR "WARN: Invalid resumable_type '$resumable_type'\n";
+   print STDERR "      Setting to default MULTIPLE\n";
+
+   $resumable_type = "MULTIPLE";
+}
+
+
+# FILES
+my $files = { };
+
+for( my $i=8; $i < (@ARGV-1); $i=$i+2 ) {
+   my $file = $ARGV[$i];
+   my $mime = $ARGV[$i+1];
+   
+   # print "ARG: $i $file $mime\n";
+
+   if( ! -f $file ) {
+      print STDERR "WARN: Not a file - $file\n";
+   }
+   else {
+      $mime = "application/octet-stream" if $mime eq "";
+
+      $files->{$file} = $mime;
+   }
+}
+
+if( scalar keys %$files == 0 ) {
+   print "ERROR: No files to upload\n\n";
+   print_usage();
+}
+
+
+
+if($debug) {
+   print "DRIVE NAME  = $drive_name\n";
+   print "PATH NAME   = $path_name\n";
+   print "UPDATE      = $update\n";
+   print "UPLOAD      = $upload_files\n";
+   print "DEBUG       = $debug\n";
+   print "FILES       = ";
+
+   foreach ( keys %$files ) {
+      print "$_  $files->{$_}\n";
+      print "              ";
+   }
+   
+   print "\n\n";
+}
+
+
+
+
+
+#======================================================================
+# Google API
+#======================================================================
+my $g = GoogleAPI->new( { storage_dir => $sdir } );
+
+$g->{debug}      = 1 if $debug > 1;
+$g->{debug_http} = 1 if $debug > 1;
+
+$g->{retry_max}  = 1;
+
+# Check and Refresh the token if needed
+if( $g->oauth2_check_token() ) {
+   print "ERROR: Problem refreshing token\n";
+   exit 1;
+}
+
+
+
+
+
+my $rc;
+my $msg;
+
+#------------------------------------------------------------
+# Get the Drive
+#------------------------------------------------------------      
+my $drive = GoogleAPI::Drive::TeamDrive->get( $g, $drive_name );
+
+if(! $drive) {
+   $rc  = 1;
+   $msg = "ERROR: could not find shared drive - $drive_name";
+   print "$msg\n";
+   exit $rc;
+}
+
+my $drive_id = $drive->{id};
+
+print "DRIVE ID = $drive_id\n\n" if $debug;
+print Dumper($drive), "\n\n\n" if $debug > 1;
+
+      
+
+
+#------------------------------------------------------------
+# Get the Folder if not already passed in
+#------------------------------------------------------------
+my $folder;
+
+if( $path_name ne "" ) {
+   $folder = $drive->walk_path($path_name);
+}
+else {
+   $folder = $drive;
+}
+
+if(! $folder) {
+   $rc  = 1;
+   $msg =  "ERROR: could not find folder - ";
+   $msg .= "$drive_name - $path_name";
+   print "$msg\n";
+   exit $rc;
+}
+         
+my $folder_id = $folder->{id};
+
+      
+print "FOLDER ID = $folder_id\n\n" if $debug;
+print Dumper($folder), "\n\n\n" if $debug > 1;
+
+
+
+
+
+#----------------------------------------------------------------------
+#
+# Go thru files and upload each one
+#
+#----------------------------------------------------------------------
+foreach my $filepath ( keys %$files ) {
+
+   if( ! -f $filepath ) {
+      print STDERR "ERROR: Not a file '$filepath' - Skipping\n";
+      next;
+   }
+   
+   my $filename = basename($filepath);
+   my $mimetype = $files->{$filepath};
+
+   if( $debug ) {
+      print "FILEPATH = $filepath\n";
+      print "FILENAME = $filename\n";
+      print "MIMETYPE = $mimetype\n";
+   }
+
+   
+
+   #------------------------------------------------------------
+   # Search for the file
+   #------------------------------------------------------------
+   my $query;
+
+   $query .= qq("$folder_id" in parents );
+   $query .= qq(and trashed = false );
+   $query .= qq(and name = "$filename" );
+   
+   print "QUERY:\n$query\n\n" if $debug;
+   
+   my $fields = "files(kind,id,name,createdTime,modifiedTime,mimeType,parents)";
+
+   my $params = { corpora => 'drive',
+                  q       => $query,
+                  fields  => $fields,
+                  driveId => $drive_id,
+                  supportsAllDrives => 'true',
+                  includeItemsFromAllDrives => 'true'  };
+   
+   my $flist =  GoogleAPI::Drive::FileList->new( $g, $params );
+   
+   if(! $flist) {
+      print "WARN: Could not get File List for $filename";
+   }
+   
+   my $filecnt = scalar @{$flist->{files}};
+   
+   print "FILE LIST - Found $filecnt files\n\n" if $debug;
+   print Dumper($flist), "\n\n" if $debug > 1;
+   
+
+   # It is possible that multiple files are returned since
+   # Drive allows files of the same name in a folder
+   #
+   # This takes the first one returned in the list
+   my $file = $flist->{files}->[0] if $filecnt;
+
+   
+   if( $file && $debug ) {
+      print "\n\nFOUND FILE\n";
+      print "FILE = $file->{name}\n";
+      print "ID   = $file->{id}\n";
+   }
+   
+
+
+   #============================================================
+   #
+   # DELETE THE FILE
+   #
+   # If multiple files were returned above
+   # only the first one in the list will be deleted
+   #
+   #============================================================
+   if( $file && ($update == 2) ) {
+
+      print "DELETE FILE - ", $file->{name}, "\n" if $debug;
+
+      my $rc = $file->delete( { supportsAllDrives => 'true' } );      
+      print "   RC = $rc\n" if $debug;
+      
+      if( $rc ) {
+         print STDERR "ERROR: Problem deleting the file - ",
+             $file->{name}, "\n";
+      }
+      else {
+         print "FILE DELETED - ", $file->{name}, "\n\n" if $debug;
+      }
+
+      
+      $file = undef;
+   }
+   
+   
+
+
+   #============================================================
+   #
+   # UPLOAD FILE
+   #
+   #============================================================
+   my $retcode     = 0;
+   my $file_upload = undef;
+   my $filesize    = (stat $filepath)[7];
+   
+   
+   #------------------------------------------------------------
+   # MULITPART Upload
+   # Files less than 5 MB according to Google API docs
+   #------------------------------------------------------------
+   if( $filesize < $maxsize ) {
+
+      my $params = { supportsAllDrives => 'true',
+                     uploadType        => 'multipart' };
+      
+      if( $update && $file ) {
+         ($file_upload, $retcode) = $file->upload
+             ( $g, $params, { }, $filepath, $mimetype );
+      }
+      else {
+         ($file_upload, $retcode) = GoogleAPI::Drive::File->upload
+             ( $g, $params,
+               { name     => $filename,
+                 parents  => [ $folder_id ] },
+               $filepath, $mimetype );
+      }
+      
+      
+      if( $debug ) {
+         print "\n\nUPLOADED FILE - $filename\n";
+         print Dumper($file_upload) . "\n\n";
+      }
+   }
+   #----------------------------------------------------------------------
+   # RESUMABLE SINGLE Upload
+   # https://developers.google.com/drive/api/v3/manage-uploads#resumable
+   # Files larger than 5 MB according to Google API docs
+   #----------------------------------------------------------------------
+   elsif( uc $resumable_type eq "SINGLE" ) {
+
+      my $params = { supportsAllDrives => 'true',
+                     uploadType        => 'resumable' };
+      
+
+      #------------------------------------------------------------
+      # Update the existing file found in Drive
+      # Make call using the File object
+      #------------------------------------------------------------
+      if( $update && $file ) {
+
+         # Make initial call to get the upload_id - good for one week
+         my $upload_id =
+             $file->upload_resumable_init
+             ( $g, $params, { }, $filepath, $mimetype );
+
+         print "UPLOAD ID = $upload_id\n" if $debug;
+         
+         if( $upload_id ne "" ) {
+            $params->{upload_id} = $upload_id;
+
+            ($file_upload, $retcode) =
+                $file->upload_resumable_single
+                ( $g, $params, { }, $filepath, $mimetype );
+         }
+      }
+      #------------------------------------------------------------
+      # Upload a new file in Drive
+      # Make call using module name 'GoogleAPI::Drive::File'
+      #------------------------------------------------------------
+      else {
+         my $reqbody = { name     => $filename,
+                         parents  => [ $folder_id ] };
+
+         my $upload_id =
+             GoogleAPI::Drive::File->upload_resumable_init
+             ( $g, $params, $reqbody );
+
+         print "UPLOAD ID = $upload_id\n" if $debug;
+         
+         if( $upload_id ne "" ) {
+            $params->{upload_id} = $upload_id;
+
+            ($file_upload, $retcode)=
+                GoogleAPI::Drive::File->upload_resumable_single
+                ( $g, $params, $reqbody, $filepath, $mimetype );
+         }
+      }
+      
+      
+      if( $debug ) {
+         print "\n\nUPLOADED FILE - $filename   RETCODE = $retcode\n";
+         print Dumper($file_upload) . "\n\n" if $retcode == 1;
+      }
+
+
+      # Check if the upload was interrupted
+      if( $retcode == 503 ) {
+         print "\nUPLOAD INTERRUPTED - $filename\n";
+         
+      }
+
+      
+   }
+   #----------------------------------------------------------------------
+   # RESUMABLE MULTIPLE Upload
+   # https://developers.google.com/drive/api/v3/manage-uploads#resumable
+   # Files larger than 5 MB according to Google API docs
+   #
+   # Seem to upload faster when uploading in chunks
+   #----------------------------------------------------------------------
+   elsif( uc $resumable_type eq "MULTIPLE" ) {
+
+      my $params = { supportsAllDrives => 'true',
+                     uploadType        => 'resumable' };
+      
+
+      #------------------------------------------------------------
+      # Update the existing file found in Drive
+      # Make call using the File object
+      #------------------------------------------------------------
+      if( $update && $file ) {
+         
+         # Make initial call to get the upload_id - good for one week
+         my $upload_id =
+             $file->upload_resumable_init
+             ( $g, $params, { name => $filename }, $filepath, $mimetype );
+
+         print "UPLOAD ID = $upload_id\n" if $debug;
+         
+         if( $upload_id ne "" ) {
+            $params->{upload_id} = $upload_id;
+
+            ($file_upload, $retcode) =
+                $file->upload_resumable_multiple
+                ( $g, $params,
+                  { name => $filename }, $filepath, $mimetype );
+         }
+      }
+      #------------------------------------------------------------
+      # Upload a new file in Drive
+      # Make call using module name 'GoogleAPI::Drive::File'
+      #------------------------------------------------------------
+      else {
+         my $reqbody = { name     => $filename,
+                         parents  => [ $folder_id ] };
+
+         my $upload_id =
+             GoogleAPI::Drive::File->upload_resumable_init
+             ( $g, $params, $reqbody );
+
+         print "UPLOAD ID = $upload_id\n" if $debug;
+         
+         if( $upload_id ne "" ) {
+            $params->{upload_id} = $upload_id;
+            
+            ($file_upload, $retcode) =
+                GoogleAPI::Drive::File->upload_resumable_multiple
+                ( $g, $params, $reqbody, $filepath, $mimetype );
+         }
+      }
+      
+      
+      if( $debug ) {
+         print "\n\nUPLOADED FILE - $filename   RETCODE = $retcode\n";
+         print Dumper($file_upload) . "\n\n" if $retcode == 1;
+      }
+
+
+      # Check if the upload was interrupted
+      if( $retcode == 503 ) {
+         print "\nUPLOAD INTERRUPTED - $filename\n";
+         
+      }      
+   }
+
+
+
+   #------------------------------------------------------------
+   # Was the upload successful
+   #------------------------------------------------------------
+   if( $file_upload &&
+       exists $file_upload->{id} &&
+       $file_upload->{id} ne "" ) {
+
+      print "FILE UPLOADED $retcode ",
+          $file_upload->{name}, "  ",
+          $file_upload->{mime}, "\n";
+   }
+   else {
+      print "PROBLEM UPLOADING $retcode  $filepath\n",
+   }
+   
+}
+
+
+
+
+
+
+#======================================================================
+# END OF MAIN PROGRAM
+#======================================================================
+if( $debug ) {
+   print "\n\n\nERROR:\n";
+   $g->dump_error();
+}
+
+if( $debug > 1 ) {
+   print "\n\n\GoogleAPI DEBUG:\n";
+   $g->dump_debug();
+}
+
+
+
+#======================================================================
+# USAGE
+#======================================================================
+sub print_usage {
+   print
+       "USAGE:  upload_files \n",  
+       "            < Google API Storage Dir >\n",
+       "            < drive name >\n",
+       "            < path name >\n",
+       "            < update files  0=upload 1=upload/update 2=delete/upload >\n",
+       "            < upload files flag  0|1 >\n",
+       "            < resumable upload filesize threshold (default 5mb) >\n",
+       "            < resumable upload type  SINGLE|MULTIPLE >\n",
+       "            < debug flag  0|1 >\n",
+       "            < local file name 1 >  < mimetype 1 >\n",
+       "                ..., \n",
+       "            < local file name N >  < mimetype N >\n",
+       "\n\n";
+
+
+   
+   exit 1;
+}
+
