@@ -118,7 +118,7 @@ STEP 1
 - Click CREATE
 
 STEP 2
-- Select the Role - Project > Owner
+- [OPTIONAL] Select the Role - Project > Owner
 - Click CONTINUE
 
 STEP 3
